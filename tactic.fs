@@ -20,7 +20,8 @@
 \ clock: tick seconds remaining_ticks
 \ arena: size gravity terrain_kind ground_height(x y)
 \ me: health position velocity heading pitch roll angular_velocity
-\   attitude grounded altitude applied
+\   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+\   from_mount(heading pitch) mount_toward(point)
 \ battery: charge capacity regen sustainable_drive compute
 \   drive_cost(fraction)
 \ drive: hover_lift
@@ -42,7 +43,8 @@
 \ score: me best armour
 \ angles: normalize(degrees) angle_diff(target current)
 \   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-\   distance(a b) clamp(value low high)
+\   distance(a b) to_chassis(heading pitch attitude)
+\   from_chassis(heading pitch attitude) clamp(value low high)
 \ raw: number(path) text(path) has(path) flag(path) count(path) line()
 \ Controls: drive.set(throttle turn pitch_turn)
 \   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -71,6 +73,7 @@
   \ The heaviest shot that still covers the range in about a second, aimed
   \ where the target will be, lobbed under gravity.
   range 1e power-for-flight-time { f: power }
+  \ lead is the intercept if the target holds course.
   t contact-position t contact-velocity power lead
   if fdrop else t contact-bearing t contact-elevation then { f: h f: p }
   h p aim!
@@ -98,9 +101,25 @@
   free? if tick 10 / 3 mod 1- 35 * s>f else 0e then scan!
   s" SEARCH" status-text! ;
 
+\ A simple dodge: vary it, or predict the shooter. A shot heard once the
+\ last dodge is over starts the next for half a second.
+0 value dodges  0 value dodge-end
+: shot-heard? ( -- f ) false cues 0 ?do i cue# contact-source muzzle = or loop ;
+\ Off the line of fire: left, then right next time (turn is positive left,
+\ strafe positive right).
+: left? ( -- f ) dodges 1 and 0<> ;
+: dodge ( -- )
+  tick dodge-end >= shot-heard? and if  dodges 1+ to dodges  tick 10 + to dodge-end  then
+  tick dodge-end < if
+    forces? if 0.5e throttle!  left? if -1e else 1e then strafe!
+    else 1e throttle!  left? if 1e else -1e then turn! then
+    left? if s" dodge:left" else s" dodge:right" then dodges s>f status!
+  then ;
+
 : on-turn ( -- )
   0.2e brake!
   nearest dup 0>= if track else drop cue? if follow-cue else sweep then then
+  dodge
   \ Low battery: drive gently so the shots can still be paid for.
   battery battery-capacity 4e f/ f< if throttle@ 0.5e f* throttle! then
   \ The storm hurts inside: drive straight away from its centre.
