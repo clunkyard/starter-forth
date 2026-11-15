@@ -5,6 +5,12 @@
 \ only when the turret is on target, keeps battery back for driving and
 \ keeps out of the storm.
 \
+\ Bearing is earned: a scan contact's bearing is off by up to its
+\ bearing error (degrees, a fixed share of the arc), so a wide beam finds a
+\ robot and a narrow one aims at it. The robot narrows the beam, holds it
+\ on the target and aims along a line fitted through its recent sightings.
+\ Contacts within 120 units are exact.
+\
 \ The trade-offs (the game words have the numbers from hello):
 \   scan     a narrow arc reaches further; a wide one finds robots nearby
 \   power    heavy shots hit harder for less battery, but fly slowly
@@ -58,28 +64,121 @@
 \ Manual: https://clunkyard.com/manual#sdk
 
 0.33e fconstant search-turn  \ enough to turn against the brake in the force rulesets
+40e fconstant search-arc     \ degrees: sweeps the circle in half a second
+60e fconstant hold-width     \ units across at the target: it stays in the beam from tick to tick
+6e fconstant min-arc         \ degrees: the narrowest the beam holds
+12 constant fit-window           \ ticks of sightings the aim averages
+8 constant fit-sightings         \ narrow sightings in the window before a shot
+40 constant look-every       \ ticks between looks around the target, for a nearer robot
+10 constant reacquire-ticks  \ ticks to look again where a lost target was
 0 value free?                \ flying free, robots may be above or below
+0 value target-slot          \ the last target's slot, for looking again where it was lost
 
 : on-start ( -- ) mode-3d? gravity-z f0= and to free? ;
 
 : steer ( F: target current per -- turn ) frot frot angle-diff fswap f/ clamp ;
+
+\ The target's recent sightings, as the tracker keeps them (up to 32).
+32 constant history-max
+create sight-tick history-max cells allot
+create sight-err history-max floats allot
+create sight-x history-max floats allot
+create sight-y history-max floats allot
+create sight-z history-max floats allot
+: sight@ ( addr i -- F: v ) floats + f@ ;
+: sight! ( addr i F: v -- ) floats + f! ;
+: take-sighting ( tick source i F: err range-err x y z -- )
+  { tick source i }
+  sight-z i sight!  sight-y i sight!  sight-x i sight!  fdrop  sight-err i sight!
+  tick sight-tick i cells + ! ;
+: load-sightings ( slot -- n )  cy-tracker-history cy-result drop  dup >r 0 ?do i take-sighting loop  r> ;
+
+0 value sight-n  0 value fit-n  fvariable fit-best  fvariable fit-limit  fvariable fit-t0  fvariable fit-spread
+fvariable fit-mean-x  fvariable fit-mean-y  fvariable fit-mean-z
+fvariable fit-x  fvariable fit-y  fvariable fit-z  fvariable fit-vx  fvariable fit-vy  fvariable fit-vz
+: sight-recent? ( i -- f ) cells sight-tick + @ tick fit-window - > ;
+: sight-narrow? ( i -- f ) dup sight-recent? swap sight-err swap sight@ fit-limit f@ f<= and ;  \ the narrow ones
+: sight-tick-of ( i -- F: tick ) cells sight-tick + @ s>f ;
+: sight-x-of ( i -- F: x ) sight-x swap sight@ ;
+: sight-y-of ( i -- F: y ) sight-y swap sight@ ;
+: sight-z-of ( i -- F: z ) sight-z swap sight@ ;
+: sight-spread-of ( i -- F: dt^2 ) sight-tick-of fit-t0 f@ f- fdup f* ;
+: sight-cross-x ( i -- F: dt*dx ) dup sight-tick-of fit-t0 f@ f- sight-x-of fit-mean-x f@ f- f* ;
+: sight-cross-y ( i -- F: dt*dy ) dup sight-tick-of fit-t0 f@ f- sight-y-of fit-mean-y f@ f- f* ;
+: sight-cross-z ( i -- F: dt*dz ) dup sight-tick-of fit-t0 f@ f- sight-z-of fit-mean-z f@ f- f* ;
+: sight-total ( xt -- F: sum ) 0e sight-n 0 ?do i sight-narrow? if i over execute f+ then loop drop ;
+: sight-mean ( xt -- F: mean ) sight-total fit-n s>f f/ ;
+: sight-slope ( xt -- F: per-tick ) sight-total fit-spread f@ f/ ;
+
+\ A straight line through the narrowest of the last window ticks' sightings:
+\ where the robot is now (fit-x fit-y fit-z) and how fast it moves
+\ (fit-vx fit-vy fit-vz), and how many sightings it rests on, 0 for no fit.
+\ Each sighting is off by its bearing error; the line averages that out.
+: fit ( slot -- count )
+  load-sightings to sight-n
+  1e9 fit-best f!
+  sight-n 0 ?do i sight-recent? if sight-err i sight@ fit-best f@ fmin fit-best f! then loop
+  1.5e fit-best f@ f* fit-limit f!
+  0 to fit-n  sight-n 0 ?do i sight-narrow? if fit-n 1+ to fit-n then loop
+  fit-n 2 < if 0 exit then
+  ['] sight-tick-of sight-mean fit-t0 f!
+  ['] sight-x-of sight-mean fit-mean-x f!  ['] sight-y-of sight-mean fit-mean-y f!  ['] sight-z-of sight-mean fit-mean-z f!
+  ['] sight-spread-of sight-total fit-spread f!
+  tick s>f fit-t0 f@ f- { f: ahead }  tick-rate s>f { f: rate }
+  ['] sight-cross-x sight-slope { f: sx }  ['] sight-cross-y sight-slope { f: sy }  ['] sight-cross-z sight-slope { f: sz }
+  fit-mean-x f@ sx ahead f* f+ fit-x f!  fit-mean-y f@ sy ahead f* f+ fit-y f!  fit-mean-z f@ sz ahead f* f+ fit-z f!
+  sx rate f* fit-vx f!  sy rate f* fit-vy f!  sz rate f* fit-vz f!
+  fit-n ;
+
+\ The slot of the nearest contact, for its history.
+: nearest-slot ( -- slot ) cy-sensors-nearest cy-result if drop 8 0 do fdrop loop else 0 then ;
+
+\ The beam that is hold-width across at a range: narrow enough for a precise
+\ bearing, wide enough to keep the target in it from tick to tick.
+: hold-arc ( F: range -- arc ) hold-width 2e f/ fswap fatan2 2e f* 180e f* 3.141592653589793e f/ min-arc fmax ;
 
 : track ( i -- )
   { t }  t contact-range { f: range }
   range 350e f> if 0.7e else range 200e f< if -0.4e else 0.2e then then
   t contact-bearing heading 45e steer
   t contact-elevation pitch f- 45e f/ clamp drive!
-  t contact-bearing 20e t contact-elevation scan!  \ narrow: holds it, reaching about 735
+  \ Halve the beam each tick until it is hold-width across at the target.
+  \ In a crowd a narrow beam sees one robot: every look-every ticks, widen it
+  \ for a tick, and a nearer robot it finds becomes the target.
+  range hold-arc { f: hold }
+  tick look-every mod 0= if search-arc else scan-arc 2e f/ search-arc fmin hold fmax then { f: arc }
+  t contact-bearing arc t contact-elevation scan!
   \ The heaviest shot that still covers the range in about a second, aimed
   \ where the target will be, lobbed under gravity.
   range 1e power-for-flight-time { f: power }
-  \ lead is the intercept if the target holds course.
-  t contact-position t contact-velocity power lead
-  if fdrop else t contact-bearing t contact-elevation then { f: h f: p }
+  \ An exact contact: lead is the intercept if the target holds course. A
+  \ noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+  t contact-bearing-error f0> if
+    nearest-slot dup to target-slot fit { count }
+    count fit-sightings >=
+    count 0<> if fit-x f@ fit-y f@ fit-z f@ fit-vx f@ fit-vy f@ fit-vz f@ power lead else false then
+  else
+    true
+    t contact-position t contact-velocity power lead
+  then
+  if fdrop else t contact-bearing t contact-elevation then { f: h f: p } { ready }
   h p aim!
   h aim-heading angle-diff fabs 3e f<  p aim-pitch f- fabs 3e f< and
-  power 10e can-fire? and if power fire! then
-  s" TRACK" range status! ;
+  power 10e can-fire? and ready and if power fire! then
+  ready if s" TRACK" else s" NARROW" then range status! ;
+
+\ Lost it: look again where it was last seen, widening the beam, before searching.
+: lost? ( -- f )
+  target-slot 0= if false exit then
+  target-slot cy-tracker-last-seen cy-result 0= if false exit then
+  tick swap - reacquire-ticks <= ;
+: reacquire ( -- )
+  target-slot cy-tracker-position cy-result 0= if position then { f: wx f: wy f: wz }
+  position wx wy wz bearing-to { f: bearing }
+  free? if position wx wy wz elevation-to else 0e then { f: elevation }
+  0.5e bearing heading 45e steer elevation pitch f- 45e f/ clamp drive!
+  bearing  scan-arc 2e f* search-arc fmin  elevation scan!
+  s" REACQUIRE" status-text! ;
 
 \ Head for where it was heard, sweeping an arc that still reaches it across
 \ the bearing's error (and, flying free, the elevation's).
@@ -97,7 +196,7 @@
 \ Sweeps the circle in half a second, flying free at three heights in turn.
 : sweep ( -- )  \ SEARCH is the standard string word
   0.5e search-turn pitch fnegate 45e f/ clamp drive!
-  scan-heading 36e f+ fnormalize 40e
+  scan-heading 36e f+ fnormalize search-arc
   free? if tick 10 / 3 mod 1- 35 * s>f else 0e then scan!
   s" SEARCH" status-text! ;
 
@@ -118,7 +217,7 @@
 
 : on-turn ( -- )
   0.2e brake!
-  nearest dup 0>= if track else drop cue? if follow-cue else sweep then then
+  nearest dup 0>= if track else drop lost? if reacquire else cue? if follow-cue else sweep then then then
   dodge
   \ Low battery: drive gently so the shots can still be paid for.
   battery battery-capacity 4e f/ f< if throttle@ 0.5e f* throttle! then
